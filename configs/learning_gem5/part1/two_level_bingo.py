@@ -7,7 +7,7 @@ from m5.objects import (
     System, Root, Process, SEWorkload,
     SrcClockDomain, VoltageDomain,
     AddrRange, SystemXBar, L2XBar, MemCtrl, DDR3_1600_8x8,
-    X86TimingSimpleCPU,
+    X86TimingSimpleCPU, X86O3CPU,
     BingoPrefetcher,
 )
 
@@ -32,15 +32,19 @@ SimpleOpts.add_option("--argv", type=str, default="",
 
 SimpleOpts.add_option("--maxinsts", type=int, default=200000,
                       help="Measurement instructions after warmup (0 = run until program exits)")
+SimpleOpts.add_option("--cpu", choices=["timing", "o3"], default="timing")
 
 # Bingo knobs
-SimpleOpts.add_option("--bingo-degree", type=int, default=2)
 SimpleOpts.add_option("--warmup-insts", type=int, default=0,
                       help="Warmup instructions before stats reset")
+SimpleOpts.add_option("--bingo-region-size", type=int, default=2048)
 SimpleOpts.add_option("--bingo-history-entries", type=int, default=16384)
 SimpleOpts.add_option("--bingo-history-assoc", type=int, default=16)
-SimpleOpts.add_option("--bingo-page-buf-entries", type=int, default=8)
+SimpleOpts.add_option("--bingo-ft-entries", type=int, default=64)
+SimpleOpts.add_option("--bingo-at-entries", type=int, default=128)
 SimpleOpts.add_option("--bingo-vote-percent", type=int, default=20)
+SimpleOpts.add_option("--bingo-max-pf", type=int, default=0,
+                      help="Cap on prefetches per trigger (0 = whole footprint, as in the paper)")
 SimpleOpts.add_option("--enable-bingo", action="store_true", default=False,
                       help="Enable Bingo prefetcher on L2")
 
@@ -55,7 +59,7 @@ system.clk_domain.voltage_domain = VoltageDomain()
 system.mem_mode = "timing"
 system.mem_ranges = [AddrRange("512MiB")]
 
-system.cpu = X86TimingSimpleCPU()
+system.cpu = X86O3CPU() if args.cpu == "o3" else X86TimingSimpleCPU()
 
 system.cpu.icache = L1ICache(args)
 system.cpu.dcache = L1DCache(args)
@@ -69,14 +73,20 @@ system.cpu.dcache.connectBus(system.l2bus)
 
 system.l2cache = L2Cache(args)
 if args.enable_bingo:
+    # The paper trains on every LLC access (hits included) and predicts on
+    # the trigger access, so the prefetcher must see hits too.
     system.l2cache.prefetcher = BingoPrefetcher(
-        degree=args.bingo_degree,
+        region_size=f"{args.bingo_region_size}B",
         history_entries=args.bingo_history_entries,
         history_assoc=args.bingo_history_assoc,
-        page_buf_entries=args.bingo_page_buf_entries,
+        ft_entries=args.bingo_ft_entries,
+        at_entries=args.bingo_at_entries,
         vote_percent=args.bingo_vote_percent,
-
-        on_miss=True,
+        max_prefetches=args.bingo_max_pf,
+        queue_size=64,
+        on_miss=False,
+        prefetch_on_access=True,
+        prefetch_on_pf_hit=False,
         on_inst=False,
         on_write=False,
         on_read=True,

@@ -1,391 +1,255 @@
 #include "mem/cache/prefetch/bingo.hh"
 
-#include <algorithm>
-#include <cmath>
-
-#include "mem/packet.hh"
-#include "mem/request.hh"
+#include "base/intmath.hh"
+#include "base/logging.hh"
 
 namespace gem5
 {
 namespace prefetch
 {
 
-// Stats
 BingoPrefetcher::BingoStats::BingoStats(statistics::Group *parent)
     : statistics::Group(parent),
-      lookups(this, "bingo_lookups", "calculatePrefetch calls"),
-
-      hist_long_hits(this, "bingo_hist_long_hits",
-                     "history long-event hits (PC+page)"),
-      hist_short_hits(this, "bingo_hist_short_hits",
-                      "history short-event hits (PC+offset)"),
-      hist_misses(this, "bingo_hist_misses", "history misses"),
-
-      pagebuf_hits(this, "bingo_pagebuf_hits", "page buffer hits"),
-      pagebuf_inserts(this, "bingo_pagebuf_inserts", "page buffer inserts"),
-      pagebuf_evictions(this, "bingo_pagebuf_evictions",
-                        "page buffer evictions (capacity; may commit-to-history)"),
-      pagebuf_commits(this, "bingo_pagebuf_commits",
-                      "page footprints committed on true residency end (eviction-driven)"),
-
-      issued(this, "bingo_issued", "prefetches issued"),
-      dropped_dup(this, "bingo_dropped_dup", "dropped duplicates in same trigger"),
-      dropped_same_page(this, "bingo_dropped_same_page",
-                        "dropped due to same-page policy")
+      ADD_STAT(triggers, statistics::units::Count::get(),
+               "trigger accesses (first access to a region)"),
+      ADD_STAT(long_hits, statistics::units::Count::get(),
+               "triggers predicted from a PC+Address match"),
+      ADD_STAT(short_hits, statistics::units::Count::get(),
+               "triggers predicted by PC+Offset voting"),
+      ADD_STAT(hist_misses, statistics::units::Count::get(),
+               "triggers with no history match"),
+      ADD_STAT(commits_evict, statistics::units::Count::get(),
+               "footprints stored at the end of region residency"),
+      ADD_STAT(commits_capacity, statistics::units::Count::get(),
+               "footprints stored because the accumulation table was full"),
+      ADD_STAT(filter_drops, statistics::units::Count::get(),
+               "single-access regions dropped from the filter table"),
+      ADD_STAT(predicted, statistics::units::Count::get(),
+               "blocks predicted (before cache filtering)"),
+      ADD_STAT(issued, statistics::units::Count::get(),
+               "prefetch candidates handed to the queue")
 {
 }
 
-// ctor
 BingoPrefetcher::BingoPrefetcher(const Params &p)
     : Queued(p),
-      degree(p.degree),
-      enforceSamePage(true),
-      historyEntries(p.history_entries),
-      historyAssoc(p.history_assoc),
-      pageBufEntries(p.page_buf_entries),
+      regionShift(floorLog2(p.region_size)),
+      blocksPerRegion(p.region_size / p.block_size),
+      historySets(p.history_entries / p.history_assoc),
       votePercent(p.vote_percent),
-      stats(this),
-      history(historyEntries / historyAssoc, HistSet(historyAssoc)),
-      pagebuf(pageBufEntries)
+      maxPrefetches(p.max_prefetches),
+      filter(p.ft_entries),
+      accum(p.at_entries),
+      history(p.history_entries / p.history_assoc,
+              std::vector<HistEntry>(p.history_assoc)),
+      stats(this)
 {
-    regProbeListeners();
+    fatal_if(!isPowerOf2(p.region_size) || p.region_size < p.block_size,
+             "Bingo: region_size must be a power of two >= block size");
+    fatal_if(blocksPerRegion > MaxBlocks,
+             "Bingo: at most %d blocks per region", MaxBlocks);
+    fatal_if(historySets == 0 || p.history_entries % p.history_assoc,
+             "Bingo: history_entries must be a multiple of history_assoc");
+    fatal_if(p.ft_entries == 0 || p.at_entries == 0,
+             "Bingo: filter and accumulation tables need entries");
 }
 
-// probeAddr helper 
-Addr
-BingoPrefetcher::probeAddr(const PacketPtr &pkt) const
+unsigned
+BingoPrefetcher::setIndex(Addr pc, unsigned offset) const
 {
-    if (!pkt || !pkt->req) {
-        return 0;
-    }
-    if (useVirtualAddresses) {
-        return pkt->getAddr();
-    }
-    return pkt->req->getPaddr();
+    uint64_t x = (uint64_t(pc) << 6) ^ offset;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return x % historySets;
 }
 
-uint64_t
-BingoPrefetcher::mix64(uint64_t x) const
+std::vector<BingoPrefetcher::HistEntry> &
+BingoPrefetcher::setFor(Addr pc, unsigned offset)
 {
-    // splitmix64
-    x += 0x9e3779b97f4a7c15ULL;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    return x ^ (x >> 31);
+    return history[setIndex(pc, offset)];
 }
 
-uint64_t
-BingoPrefetcher::hashLong(Addr pc, Addr page_tag) const
+template <typename Entry>
+Entry *
+BingoPrefetcher::find(std::vector<Entry> &table, Addr region)
 {
-    return mix64((uint64_t)pc ^ (mix64((uint64_t)page_tag) + 0x1234ULL));
-}
-
-uint64_t
-BingoPrefetcher::hashShort(Addr pc, uint16_t off) const
-{
-    return mix64((uint64_t)pc ^ ((uint64_t)off << 1) ^ 0xBEEF1234ULL);
-}
-
-// page buffer ops
-BingoPrefetcher::PageBufEntry*
-BingoPrefetcher::findPageBuf(Addr page_tag)
-{
-    for (auto &e : pagebuf) {
-        if (e.valid && e.page_tag == page_tag)
+    for (auto &e : table) {
+        if (e.valid && e.region == region)
             return &e;
     }
     return nullptr;
 }
 
-void
-BingoPrefetcher::commitPageBufToHistory(const PageBufEntry &pbe)
+template <typename Entry>
+Entry &
+BingoPrefetcher::victim(std::vector<Entry> &table)
 {
-    const uint64_t long_tag = hashLong(pbe.trigger_pc, pbe.page_tag);
-    const uint64_t short_h  = hashShort(pbe.trigger_pc, pbe.trigger_off);
-
-    HistSet &set = histSetFor(short_h);
-
-    int w = histFindLong(set, long_tag);
-    if (w < 0) {
-        w = histChooseVictim(set);
-        set.ways[w] = HistEntry{};
-        set.ways[w].valid = true;
+    Entry *v = &table[0];
+    for (auto &e : table) {
+        if (!e.valid)
+            return e;
+        if (e.lru < v->lru)
+            v = &e;
     }
-
-    set.ways[w].long_tag = long_tag;
-    set.ways[w].pc = pbe.trigger_pc;
-    set.ways[w].offset = pbe.trigger_off;
-    set.ways[w].fp = pbe.fp;
-    set.ways[w].lru = (uint32_t)(++tick);
+    return *v;
 }
 
-BingoPrefetcher::PageBufEntry*
-BingoPrefetcher::allocPageBuf(Addr page_tag, Addr pc, uint16_t off)
+void
+BingoPrefetcher::commit(const AccumEntry &ae)
 {
-    // Try empty slot
-    for (auto &e : pagebuf) {
-        if (!e.valid) {
-            e = PageBufEntry{};
-            e.valid = true;
-            e.page_tag = page_tag;
-            e.trigger_pc = pc;
-            e.trigger_off = off;
+    auto &set = setFor(ae.pc, ae.offset);
+
+    HistEntry *slot = nullptr;
+    for (auto &e : set) {
+        if (e.valid && e.pc == ae.pc && e.region == ae.region &&
+            e.offset == ae.offset) {
+            slot = &e;
+            break;
+        }
+    }
+    if (!slot)
+        slot = &victim(set);
+
+    slot->valid = true;
+    slot->pc = ae.pc;
+    slot->region = ae.region;
+    slot->offset = ae.offset;
+    slot->fp = ae.fp;
+    slot->lru = ++tick;
+}
+
+bool
+BingoPrefetcher::predict(Addr pc, Addr region, unsigned offset,
+                         Footprint &pred)
+{
+    auto &set = setFor(pc, offset);
+
+    // Long event: PC+Address.
+    for (auto &e : set) {
+        if (e.valid && e.pc == pc && e.region == region &&
+            e.offset == offset) {
             e.lru = ++tick;
-            stats.pagebuf_inserts++;
-            return &e;
+            pred = e.fp;
+            stats.long_hits++;
+            return true;
         }
     }
 
-    // Evict LRU (capacity eviction)
-    int victim = 0;
-    for (int i = 1; i < (int)pagebuf.size(); i++) {
-        if (pagebuf[i].lru < pagebuf[victim].lru)
-            victim = i;
+    // Short event: PC+Offset, all matches in the same set vote.
+    unsigned votes[MaxBlocks] = {};
+    unsigned matches = 0;
+    for (auto &e : set) {
+        if (e.valid && e.pc == pc && e.offset == offset) {
+            e.lru = ++tick;
+            matches++;
+            for (unsigned b = 0; b < blocksPerRegion; b++) {
+                if (e.fp.test(b))
+                    votes[b]++;
+            }
+        }
+    }
+    if (matches == 0) {
+        stats.hist_misses++;
+        return false;
     }
 
-    // committing pagebuf on capacity pressure (not true eviction-driven)
-    commitPageBufToHistory(pagebuf[victim]);
-    stats.pagebuf_evictions++;
-
-    pagebuf[victim] = PageBufEntry{};
-    pagebuf[victim].valid = true;
-    pagebuf[victim].page_tag = page_tag;
-    pagebuf[victim].trigger_pc = pc;
-    pagebuf[victim].trigger_off = off;
-    pagebuf[victim].lru = ++tick;
-
-    stats.pagebuf_inserts++;
-    return &pagebuf[victim];
-}
-
-// history ops 
-BingoPrefetcher::HistSet&
-BingoPrefetcher::histSetFor(uint64_t short_hash)
-{
-    const unsigned num_sets = history.size();
-    return history[(unsigned)(short_hash % num_sets)];
-}
-
-void
-BingoPrefetcher::histTouchLRU(HistSet &set, int hit_way)
-{
-    set.ways[hit_way].lru = (uint32_t)(++tick);
-}
-
-int
-BingoPrefetcher::histFindLong(const HistSet &set, uint64_t long_tag) const
-{
-    for (int w = 0; w < (int)set.ways.size(); w++) {
-        if (set.ways[w].valid && set.ways[w].long_tag == long_tag)
-            return w;
+    stats.short_hits++;
+    pred.reset();
+    for (unsigned b = 0; b < blocksPerRegion; b++) {
+        // votes/matches >= votePercent/100, without rounding
+        if (votes[b] * 100 >= votePercent * matches)
+            pred.set(b);
     }
-    return -1;
-}
-
-std::vector<int>
-BingoPrefetcher::histFindShortMatches(const HistSet &set, Addr pc,
-                                      uint16_t off) const
-{
-    std::vector<int> hits;
-    for (int w = 0; w < (int)set.ways.size(); w++) {
-        const auto &e = set.ways[w];
-        if (e.valid && e.pc == pc && e.offset == off)
-            hits.push_back(w);
-    }
-    return hits;
-}
-
-int
-BingoPrefetcher::histChooseVictim(const HistSet &set) const
-{
-    for (int w = 0; w < (int)set.ways.size(); w++) {
-        if (!set.ways[w].valid) return w;
-    }
-    int victim = 0;
-    for (int w = 1; w < (int)set.ways.size(); w++) {
-        if (set.ways[w].lru < set.ways[victim].lru)
-            victim = w;
-    }
-    return victim;
-}
-
-// eviction-driven residency commit 
-void
-BingoPrefetcher::commitResidencyFootprint(Addr page_tag, const PageState &ps)
-{
-    if (!ps.hasTrigger) {
-        return;
-    }
-
-    const uint64_t long_tag = hashLong(ps.triggerPC, page_tag);
-    const uint64_t short_h  = hashShort(ps.triggerPC, ps.triggerOff);
-
-    HistSet &set = histSetFor(short_h);
-
-    int w = histFindLong(set, long_tag);
-    if (w < 0) {
-        w = histChooseVictim(set);
-        set.ways[w] = HistEntry{};
-        set.ways[w].valid = true;
-    }
-
-    set.ways[w].long_tag = long_tag;
-    set.ways[w].pc = ps.triggerPC;
-    set.ways[w].offset = ps.triggerOff;
-    set.ways[w].fp = ps.fp;
-    set.ways[w].lru = (uint32_t)(++tick);
-
-    stats.pagebuf_commits++;
-}
-
-// notifyFill / notifyEvict
-void
-BingoPrefetcher::notifyFill(const CacheAccessProbeArg &arg)
-{
-    if (!arg.pkt || !arg.pkt->req)
-        return;
-
-    const Addr a = probeAddr(arg.pkt);
-    const Addr blk = blockAddress(a);
-    const Addr ptag = pageTag(blk);
-    const uint16_t off = pageOffset(blk);
-    const Addr pc = arg.pkt->req->hasPC() ? arg.pkt->req->getPC() : 0;
-
-    // Residency accounting
-    pageLines[ptag]++;
-
-    PageState &ps = residency[ptag];
-    if (!ps.hasTrigger) {
-        ps.hasTrigger = true;
-        ps.triggerPC = pc;
-        ps.triggerOff = off;
-    }
-    ps.fp.set(off);
+    return true;
 }
 
 void
 BingoPrefetcher::notifyEvict(const CacheDataUpdateProbeArg &info)
 {
-    const Addr a = info.addr;
-    const Addr blk = blockAddress(a);
-    const Addr ptag = pageTag(blk);
+    // The first eviction of any block in a region ends its generation.
+    const Addr region = regionOf(info.addr);
 
-    auto it = pageLines.find(ptag);
-    if (it == pageLines.end()) {
+    if (AccumEntry *ae = find(accum, region)) {
+        commit(*ae);
+        stats.commits_evict++;
+        ae->valid = false;
+    }
+    if (FilterEntry *fe = find(filter, region))
+        fe->valid = false;
+}
+
+void
+BingoPrefetcher::calculatePrefetch(const PrefetchInfo &pfi,
+                                   std::vector<AddrPriority> &addresses,
+                                   const CacheAccessor &cache)
+{
+    if (!pfi.hasPC())
+        return;
+
+    const Addr pc = pfi.getPC();
+    const Addr region = regionOf(pfi.getAddr());
+    const unsigned offset = offsetOf(pfi.getAddr());
+
+    // Region already being recorded: just extend its footprint.
+    if (AccumEntry *ae = find(accum, region)) {
+        ae->fp.set(offset);
+        ae->lru = ++tick;
         return;
     }
 
-    if (it->second > 0) {
-        it->second--;
-    }
-
-    if (it->second == 0) {
-        // True residency end for this page: commit footprint to history
-        auto ps_it = residency.find(ptag);
-        if (ps_it != residency.end()) {
-            commitResidencyFootprint(ptag, ps_it->second);
-            residency.erase(ps_it);
-        }
-        pageLines.erase(it);
-    }
-}
-
-// main
-void
-BingoPrefetcher::calculatePrefetch(const PrefetchInfo &pfi, std::vector<AddrPriority> &addresses, const CacheAccessor &cache)
-{
-    stats.lookups++;
-    ++tick;
-
-    // Trigger address & PC
-    const Addr addr = pfi.getAddr();
-    const Addr blk  = blockAddress(addr);
-    const Addr pc   = pfi.hasPC() ? pfi.getPC() : 0;
-
-    const Addr ptag = pageTag(blk);
-    const uint16_t off = pageOffset(blk);
-
-    // 1) Update page buffer footprint
-    PageBufEntry *pbe = findPageBuf(ptag);
-    if (pbe) {
-        stats.pagebuf_hits++;
-        pbe->lru = tick;
-    } else {
-        pbe = allocPageBuf(ptag, pc, off);
-    }
-    pbe->fp.set(off);
-
-    // 2) Lookup history table and generate a predicted footprint
-    const uint64_t long_tag = hashLong(pc, ptag);
-    const uint64_t short_h  = hashShort(pc, off);
-
-    HistSet &set = histSetFor(short_h);
-
-    Footprint pred{};
-    int long_hit = histFindLong(set, long_tag);
-    if (long_hit >= 0) {
-        stats.hist_long_hits++;
-        pred = set.ways[long_hit].fp;
-        histTouchLRU(set, long_hit);
-    } else {
-        auto short_hits = histFindShortMatches(set, pc, off);
-        if (short_hits.empty()) {
-            stats.hist_misses++;
-            return;
-        }
-        stats.hist_short_hits++;
-
-        const int m = (int)short_hits.size();
-        const int thr = (int)std::ceil((votePercent / 100.0) * m);
-
-        std::array<int, BlocksPerPage> votes{};
-        votes.fill(0);
-
-        for (int w : short_hits) {
-            histTouchLRU(set, w);
-            const auto &fp = set.ways[w].fp;
-            for (int b = 0; b < BlocksPerPage; b++) {
-                if (fp.test(b)) votes[b]++;
+    // Second distinct block of a filtered region: start accumulating.
+    if (FilterEntry *fe = find(filter, region)) {
+        if (fe->offset != offset) {
+            AccumEntry &slot = victim(accum);
+            if (slot.valid) {
+                commit(slot);
+                stats.commits_capacity++;
             }
+            slot.valid = true;
+            slot.region = region;
+            slot.pc = fe->pc;
+            slot.offset = fe->offset;
+            slot.fp.reset();
+            slot.fp.set(fe->offset);
+            slot.fp.set(offset);
+            slot.lru = ++tick;
+            fe->valid = false;
         }
-
-        for (int b = 0; b < BlocksPerPage; b++) {
-            if (votes[b] >= thr) pred.set(b);
-        }
+        return;
     }
 
-    // 3) Emit prefetches from predicted footprint
-    pred.reset(off);
+    // Trigger access.
+    stats.triggers++;
+    FilterEntry &fslot = victim(filter);
+    if (fslot.valid)
+        stats.filter_drops++;
+    fslot.valid = true;
+    fslot.region = region;
+    fslot.pc = pc;
+    fslot.offset = offset;
+    fslot.lru = ++tick;
 
+    Footprint pred;
+    if (!predict(pc, region, offset, pred))
+        return;
+    pred.reset(offset);
+
+    // Issue the whole footprint at once, nearest blocks after the trigger
+    // first so the ones needed soonest are queued first.
     unsigned emitted = 0;
-    for (int b = 0; b < BlocksPerPage && emitted < degree; b++) {
-        if (!pred.test(b)) continue;
-
-        const Addr cand = (ptag << PageBits) + (Addr(b) * Addr(blkSize));
-
-        if (enforceSamePage && !samePageAddr(blk, cand)) {
-            stats.dropped_same_page++;
+    for (unsigned i = 1; i < blocksPerRegion; i++) {
+        const unsigned b = (offset + i) & (blocksPerRegion - 1);
+        if (!pred.test(b))
             continue;
-        }
-
-        if (cache.inCache(cand, pfi.isSecure())) {
+        stats.predicted++;
+        const Addr addr = blockOf(region, b);
+        if (cache.inCache(addr, pfi.isSecure()))
             continue;
-        }
-
-        bool dup = false;
-        for (const auto &ap : addresses) {
-            if (ap.first == cand) { dup = true; break; }
-        }
-        if (dup) {
-            stats.dropped_dup++;
-            continue;
-        }
-
-        const int prio = 0;
-        addresses.emplace_back(cand, prio);
-        emitted++;
+        addresses.emplace_back(addr, 0);
         stats.issued++;
+        if (maxPrefetches && ++emitted >= maxPrefetches)
+            break;
     }
 }
 
