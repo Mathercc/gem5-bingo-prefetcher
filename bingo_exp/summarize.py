@@ -4,6 +4,10 @@
 coverage (paper)   = misses removed / baseline misses
 overprediction     = useless prefetches / baseline misses   (paper Fig. 7)
 accuracy           = useful / issued
+late               = extra demand MSHR hits over the baseline / baseline
+                     misses: demands that caught a prefetch still in flight.
+                     gem5 counts them as misses and the prefetch as unused
+                     (pfLate stays 0 on this path), so they matter with O3.
 """
 import os, re, sys
 
@@ -26,24 +30,29 @@ def stats(tag, wl):
         miss=g("system.l2cache.demandMisses::total"),
         issued=g("system.l2cache.prefetcher.pfIssued"),
         useful=g("system.l2cache.prefetcher.pfUseful"),
-        late=g("system.l2cache.prefetcher.pfLate"),
+        # gem5 omits counters that stayed at zero
+        mshr_hits=float(d.get("system.l2cache.demandMshrHits::total", 0)),
     )
 
 
-tags = sys.argv[1:] or sorted(t for t in os.listdir(ROOT) if t != "base")
+tags = sys.argv[1:] or sorted(t for t in os.listdir(ROOT)
+                               if not t.startswith("base"))
 print(f"{'tag':14s}{'wl':9s}{'CPI':>8s}{'speedup':>9s}{'L2miss':>11s}"
-      f"{'cover':>8s}{'acc':>7s}{'overpr':>8s}")
+      f"{'cover':>8s}{'acc':>7s}{'overpr':>8s}{'late':>7s}")
 for wl in WLS:
-    b = stats("base", wl)
-    if not b:
-        continue
-    print(f"{'base':14s}{wl:9s}{b['cpi']:8.3f}{1:9.3f}{b['miss']:11.0f}")
+    shown = set()
     for t in tags:
-        s = stats(t, wl)
-        if not s:
+        # tags ending in _o3 are compared with the out-of-order baseline
+        bt = "base_o3" if t.endswith("_o3") else "base"
+        b, s = stats(bt, wl), stats(t, wl)
+        if not b or not s:
             continue
+        if bt not in shown:
+            shown.add(bt)
+            print(f"{bt:14s}{wl:9s}{b['cpi']:8.3f}{1:9.3f}{b['miss']:11.0f}")
         cov = (b["miss"] - s["miss"]) / b["miss"]
         acc = s["useful"] / s["issued"] if s["issued"] else float("nan")
         over = (s["issued"] - s["useful"]) / b["miss"]
+        late = (s["mshr_hits"] - b["mshr_hits"]) / b["miss"]
         print(f"{t:14s}{wl:9s}{s['cpi']:8.3f}{b['cpi']/s['cpi']:9.3f}"
-              f"{s['miss']:11.0f}{cov:8.1%}{acc:7.1%}{over:8.1%}")
+              f"{s['miss']:11.0f}{cov:8.1%}{acc:7.1%}{over:8.1%}{late:7.1%}")

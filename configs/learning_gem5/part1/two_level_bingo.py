@@ -8,7 +8,8 @@ from m5.objects import (
     SrcClockDomain, VoltageDomain,
     AddrRange, SystemXBar, L2XBar, MemCtrl, DDR3_1600_8x8,
     X86TimingSimpleCPU, X86O3CPU,
-    BingoPrefetcher,
+    BingoPrefetcher, SmsPrefetcher, AMPMPrefetcher, BOPPrefetcher,
+    SignaturePathPrefetcher,
 )
 
 m5.util.addToPath("../../")
@@ -45,8 +46,17 @@ SimpleOpts.add_option("--bingo-at-entries", type=int, default=128)
 SimpleOpts.add_option("--bingo-vote-percent", type=int, default=20)
 SimpleOpts.add_option("--bingo-max-pf", type=int, default=0,
                       help="Cap on prefetches per trigger (0 = whole footprint, as in the paper)")
+SimpleOpts.add_option("--bingo-events", choices=["both", "long", "short"],
+                      default="both",
+                      help="Ablation: PC+Address only, PC+Offset only, or both")
+SimpleOpts.add_option("--sms-ft-size", type=int, default=64,
+                      help="gem5 SMS filter/active-generation table size")
 SimpleOpts.add_option("--enable-bingo", action="store_true", default=False,
-                      help="Enable Bingo prefetcher on L2")
+                      help="Same as --pf bingo")
+SimpleOpts.add_option("--pf", choices=["none", "bingo", "sms", "ampm", "bop",
+                                       "spp"], default="none",
+                      help="L2 prefetcher; the others are gem5's built-in "
+                           "versions of the paper's competitors")
 
 args = SimpleOpts.parse_args()
 
@@ -73,8 +83,21 @@ system.cpu.dcache.connectBus(system.l2bus)
 
 system.l2cache = L2Cache(args)
 if args.enable_bingo:
-    # The paper trains on every LLC access (hits included) and predicts on
-    # the trigger access, so the prefetcher must see hits too.
+    args.pf = "bingo"
+
+# The paper trains every prefetcher on all LLC accesses (hits included), so
+# all of them see hits here too.
+observe = dict(
+    queue_size=64,
+    on_miss=False,
+    prefetch_on_access=True,
+    prefetch_on_pf_hit=False,
+    on_inst=False,
+    on_write=False,
+    on_read=True,
+    on_data=True,
+)
+if args.pf == "bingo":
     system.l2cache.prefetcher = BingoPrefetcher(
         region_size=f"{args.bingo_region_size}B",
         history_entries=args.bingo_history_entries,
@@ -83,15 +106,21 @@ if args.enable_bingo:
         at_entries=args.bingo_at_entries,
         vote_percent=args.bingo_vote_percent,
         max_prefetches=args.bingo_max_pf,
-        queue_size=64,
-        on_miss=False,
-        prefetch_on_access=True,
-        prefetch_on_pf_hit=False,
-        on_inst=False,
-        on_write=False,
-        on_read=True,
-        on_data=True,
+        use_long_event=args.bingo_events != "short",
+        use_short_event=args.bingo_events != "long",
+        **observe,
     )
+elif args.pf == "sms":
+    # 16K-entry history as in the paper's SMS configuration
+    system.l2cache.prefetcher = SmsPrefetcher(
+        region_size=args.bingo_region_size, pht_size=16384,
+        ft_size=args.sms_ft_size, **observe)
+elif args.pf == "ampm":
+    system.l2cache.prefetcher = AMPMPrefetcher(**observe)
+elif args.pf == "bop":
+    system.l2cache.prefetcher = BOPPrefetcher(**observe)
+elif args.pf == "spp":
+    system.l2cache.prefetcher = SignaturePathPrefetcher(**observe)
 
 system.l2cache.connectCPUSideBus(system.l2bus)
 

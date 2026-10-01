@@ -2,6 +2,8 @@
 
 #include "base/intmath.hh"
 #include "base/logging.hh"
+#include "base/trace.hh"
+#include "debug/HWPrefetch.hh"
 
 namespace gem5
 {
@@ -38,6 +40,8 @@ BingoPrefetcher::BingoPrefetcher(const Params &p)
       historySets(p.history_entries / p.history_assoc),
       votePercent(p.vote_percent),
       maxPrefetches(p.max_prefetches),
+      useLongEvent(p.use_long_event),
+      useShortEvent(p.use_short_event),
       filter(p.ft_entries),
       accum(p.at_entries),
       history(p.history_entries / p.history_assoc,
@@ -50,6 +54,8 @@ BingoPrefetcher::BingoPrefetcher(const Params &p)
              "Bingo: at most %d blocks per region", MaxBlocks);
     fatal_if(historySets == 0 || p.history_entries % p.history_assoc,
              "Bingo: history_entries must be a multiple of history_assoc");
+    fatal_if(!p.use_long_event && !p.use_short_event,
+             "Bingo: at least one event must be enabled");
     fatal_if(p.ft_entries == 0 || p.at_entries == 0,
              "Bingo: filter and accumulation tables need entries");
 }
@@ -127,6 +133,8 @@ BingoPrefetcher::predict(Addr pc, Addr region, unsigned offset,
 
     // Long event: PC+Address.
     for (auto &e : set) {
+        if (!useLongEvent)
+            break;
         if (e.valid && e.pc == pc && e.region == region &&
             e.offset == offset) {
             e.lru = ++tick;
@@ -140,7 +148,7 @@ BingoPrefetcher::predict(Addr pc, Addr region, unsigned offset,
     unsigned votes[MaxBlocks] = {};
     unsigned matches = 0;
     for (auto &e : set) {
-        if (e.valid && e.pc == pc && e.offset == offset) {
+        if (useShortEvent && e.valid && e.pc == pc && e.offset == offset) {
             e.lru = ++tick;
             matches++;
             for (unsigned b = 0; b < blocksPerRegion; b++) {
@@ -169,6 +177,7 @@ BingoPrefetcher::notifyEvict(const CacheDataUpdateProbeArg &info)
 {
     // The first eviction of any block in a region ends its generation.
     const Addr region = regionOf(info.addr);
+    DPRINTF(HWPrefetch, "Bingo: evict %#x\n", info.addr);
 
     if (AccumEntry *ae = find(accum, region)) {
         commit(*ae);
@@ -190,6 +199,8 @@ BingoPrefetcher::calculatePrefetch(const PrefetchInfo &pfi,
     const Addr pc = pfi.getPC();
     const Addr region = regionOf(pfi.getAddr());
     const unsigned offset = offsetOf(pfi.getAddr());
+    DPRINTF(HWPrefetch, "Bingo: access pc=%#x addr=%#x\n", pc,
+            pfi.getAddr());
 
     // Region already being recorded: just extend its footprint.
     if (AccumEntry *ae = find(accum, region)) {
@@ -231,9 +242,13 @@ BingoPrefetcher::calculatePrefetch(const PrefetchInfo &pfi,
     fslot.lru = ++tick;
 
     Footprint pred;
-    if (!predict(pc, region, offset, pred))
+    if (!predict(pc, region, offset, pred)) {
+        DPRINTF(HWPrefetch, "Bingo: trigger %#x none\n", pfi.getAddr());
         return;
+    }
     pred.reset(offset);
+    DPRINTF(HWPrefetch, "Bingo: trigger %#x pred=%#llx\n", pfi.getAddr(),
+            (unsigned long long)pred.to_ullong());
 
     // Issue the whole footprint at once, nearest blocks after the trigger
     // first so the ones needed soonest are queued first.

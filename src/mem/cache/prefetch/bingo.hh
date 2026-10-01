@@ -120,6 +120,8 @@ class BingoPrefetcher : public Queued
     const unsigned historySets;
     const unsigned votePercent;
     const unsigned maxPrefetches;
+    const bool useLongEvent;
+    const bool useShortEvent;
 
     std::vector<FilterEntry> filter;
     std::vector<AccumEntry> accum;

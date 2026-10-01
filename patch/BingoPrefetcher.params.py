@@ -17,3 +17,10 @@ class BingoPrefetcher(QueuedPrefetcher):
     max_prefetches = Param.Unsigned(
         0, "Cap on prefetches per trigger (0 = whole footprint)"
     )
+    use_long_event = Param.Bool(
+        True, "Look up PC+Address (disable only for ablation studies)"
+    )
+    use_short_event = Param.Bool(
+        True, "Fall back to PC+Offset voting (disable only for ablation "
+        "studies)"
+    )
