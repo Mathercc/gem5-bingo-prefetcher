@@ -8,6 +8,13 @@
 //   ./memwalk2 --mode stream --bytes 256M --iters 30
 //   ./memwalk2 --mode stride --bytes 256M --stride-lines 4 --iters 80
 //   ./memwalk2 --mode chase  --bytes 256M --iters 2 --seed 1
+//   ./memwalk2 --mode spatial --bytes 16M --iters 4 --seed 1
+//   ./memwalk2 --mode pagepat --bytes 16M --iters 4 --seed 1
+//
+// spatial: pages visited in a random order; every page uses the SAME
+//          irregular set of lines (a PC+Offset pattern, SMS-learnable).
+// pagepat: pages visited in a random order; each page has its OWN set of
+//          lines, stable across iterations (only PC+Address can learn it).
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -82,14 +89,16 @@ static inline void fence(void)
 }
 
 // modes
-typedef enum { MW_STREAM, MW_STRIDE, MW_CHASE } mw_mode_t;
+typedef enum { MW_STREAM, MW_STRIDE, MW_CHASE, MW_SPATIAL, MW_PAGEPAT } mw_mode_t;
 
 static mw_mode_t parse_mode(const char *s)
 {
     if (!strcmp(s, "stream")) return MW_STREAM;
     if (!strcmp(s, "stride")) return MW_STRIDE;
     if (!strcmp(s, "chase"))  return MW_CHASE;
-    fprintf(stderr, "Unknown mode: %s (use stream|stride|chase)\n", s);
+    if (!strcmp(s, "spatial")) return MW_SPATIAL;
+    if (!strcmp(s, "pagepat")) return MW_PAGEPAT;
+    fprintf(stderr, "Unknown mode: %s (use stream|stride|chase|spatial|pagepat)\n", s);
     exit(2);
 }
 
@@ -155,6 +164,75 @@ static void do_chase(uint8_t *buf, uint64_t n_lines, uint32_t line_size,
     *checksum ^= (uint64_t)idx;
 }
 
+// Page-footprint modes. Each page gets a list of line offsets, visited in
+// ascending order by one load, so every access shares a single PC.
+#define PAGE_BYTES 4096u
+
+typedef struct {
+    uint32_t n_pages;
+    uint32_t lines_per_page;
+    uint32_t *order;   // page visit order (random permutation)
+    uint8_t  *offs;    // n_pages * lines_per_page line offsets
+    uint8_t  *cnt;     // lines used in each page
+} pagepat_t;
+
+static void build_pagepat(pagepat_t *pp, uint64_t bytes, uint32_t line_size,
+                          int same_pattern, uint64_t seed)
+{
+    pp->n_pages = (uint32_t)(bytes / PAGE_BYTES);
+    pp->lines_per_page = PAGE_BYTES / line_size;
+    pp->order = (uint32_t *)malloc((size_t)pp->n_pages * sizeof(uint32_t));
+    pp->offs = (uint8_t *)malloc((size_t)pp->n_pages * pp->lines_per_page);
+    pp->cnt = (uint8_t *)malloc(pp->n_pages);
+    if (!pp->order || !pp->offs || !pp->cnt) die("malloc pagepat");
+
+    rng_state = seed ? seed : 1;
+    for (uint32_t p = 0; p < pp->n_pages; p++) pp->order[p] = p;
+    shuffle_u32(pp->order, pp->n_pages);
+
+    uint64_t shared_mask[4] = {0, 0, 0, 0};
+    for (uint32_t p = 0; p < pp->n_pages; p++) {
+        uint8_t *o = pp->offs + (uint64_t)p * pp->lines_per_page;
+        uint32_t c = 0;
+        for (uint32_t l = 0; l < pp->lines_per_page; l++) {
+            int take;
+            if (same_pattern && p > 0) {
+                take = (int)((shared_mask[l / 64] >> (l % 64)) & 1);
+            } else {
+                take = (int)(xorshift64() & 1);   // ~50% density
+                if (same_pattern) shared_mask[l / 64] |= (uint64_t)take << (l % 64);
+            }
+            if (take) o[c++] = (uint8_t)l;
+        }
+        if (c == 0) o[c++] = 0;
+        if (!same_pattern) {
+            // start each page at a random line of its set (then wrap), so
+            // trigger offsets differ between pages as in real code
+            uint32_t r = (uint32_t)(xorshift64() % c);
+            uint8_t tmp[256];
+            for (uint32_t k = 0; k < c; k++) tmp[k] = o[(k + r) % c];
+            memcpy(o, tmp, c);
+        }
+        pp->cnt[p] = (uint8_t)c;
+    }
+}
+
+static void do_pagepat(uint8_t *buf, const pagepat_t *pp, uint32_t line_size,
+                       uint32_t loops, volatile uint64_t *checksum)
+{
+    for (uint32_t t = 0; t < loops; t++) {
+        for (uint32_t i = 0; i < pp->n_pages; i++) {
+            const uint32_t p = pp->order[i];
+            const uint8_t *page = buf + (uint64_t)p * PAGE_BYTES;
+            const uint8_t *o = pp->offs + (uint64_t)p * pp->lines_per_page;
+            const uint32_t c = pp->cnt[p];
+            for (uint32_t k = 0; k < c; k++) {
+                *checksum += page[(uint32_t)o[k] * line_size];
+            }
+        }
+    }
+}
+
 // main
 int main(int argc, char **argv)
 {
@@ -191,7 +269,7 @@ int main(int argc, char **argv)
             seed = (uint64_t)strtoull(argv[++i], NULL, 0);
         } else if (!strcmp(a, "--help")) {
             printf("memwalk2 options:\n");
-            printf("  --mode stream|stride|chase\n");
+            printf("  --mode stream|stride|chase|spatial|pagepat\n");
             printf("  --bytes <N[K|M|G]>\n");
             printf("  --line <bytes>            (default 64)\n");
             printf("  --stride-lines <lines>    (stride mode; default 4)\n");
@@ -224,14 +302,20 @@ int main(int argc, char **argv)
 
     volatile uint64_t checksum = 0;
 
+    pagepat_t pp = {0};
+    if (mode == MW_SPATIAL || mode == MW_PAGEPAT)
+        build_pagepat(&pp, bytes, line_size, mode == MW_SPATIAL, seed);
+
     // Program-level warmup
     if (warmup) {
         if (mode == MW_STREAM) {
             do_stream(buf, n_lines, line_size, warmup, &checksum);
         } else if (mode == MW_STRIDE) {
             do_stride(buf, n_lines, line_size, stride_lines, warmup, &checksum);
-        } else {
+        } else if (mode == MW_CHASE) {
             do_chase(buf, n_lines, line_size, warmup, seed, &checksum);
+        } else {
+            do_pagepat(buf, &pp, line_size, warmup, &checksum);
         }
         fence();
     }
@@ -243,8 +327,10 @@ int main(int argc, char **argv)
         do_stream(buf, n_lines, line_size, iters, &checksum);
     } else if (mode == MW_STRIDE) {
         do_stride(buf, n_lines, line_size, stride_lines, iters, &checksum);
-    } else {
+    } else if (mode == MW_CHASE) {
         do_chase(buf, n_lines, line_size, iters, seed, &checksum);
+    } else {
+        do_pagepat(buf, &pp, line_size, iters, &checksum);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &ts1);
@@ -252,7 +338,9 @@ int main(int argc, char **argv)
                 (double)(ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
 
     const char *mname = (mode == MW_STREAM) ? "stream" :
-                        (mode == MW_STRIDE) ? "stride" : "chase";
+                        (mode == MW_STRIDE) ? "stride" :
+                        (mode == MW_CHASE)  ? "chase"  :
+                        (mode == MW_SPATIAL) ? "spatial" : "pagepat";
     printf("memwalk2: mode=%s bytes=%" PRIu64 " line=%u iters=%u stride_lines=%u seed=%" PRIu64 "\n",
            mname, bytes, line_size, iters, stride_lines, seed);
     printf("memwalk2: checksum=%" PRIu64 " host_seconds=%.6f\n",

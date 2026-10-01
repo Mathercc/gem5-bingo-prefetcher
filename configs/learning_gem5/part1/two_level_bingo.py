@@ -30,8 +30,7 @@ SimpleOpts.add_option("binary", nargs="?", default=default_binary)
 SimpleOpts.add_option("--argv", type=str, default="",
                       help="Arguments string passed to the binary (parsed by shlex.split).")
 
-SimpleOpts.add_option("--maxinsts", type=int, default=200000)
-SimpleOpts.add_option("--maxtick", type=int, default=0,
+SimpleOpts.add_option("--maxinsts", type=int, default=200000,
                       help="Measurement instructions after warmup (0 = run until program exits)")
 
 # Bingo knobs
@@ -57,7 +56,6 @@ system.mem_mode = "timing"
 system.mem_ranges = [AddrRange("512MiB")]
 
 system.cpu = X86TimingSimpleCPU()
-system.cpu.max_insts_any_thread = args.maxinsts
 
 system.cpu.icache = L1ICache(args)
 system.cpu.dcache = L1DCache(args)
@@ -115,6 +113,8 @@ system.cpu.createThreads()
 root = Root(full_system=False, system=system)
 m5.instantiate()
 
+# max_insts_any_thread is read at instantiate time only, so the warmup and
+# measurement windows are set with scheduleInstStop (relative counts).
 warmup = int(args.warmup_insts)
 maxinsts = int(args.maxinsts)
 
@@ -124,16 +124,18 @@ print("Binary argv:", process.cmd[1:] if len(process.cmd) > 1 else [])
 
 if warmup > 0:
     print(f"Warmup: {warmup} insts")
-    system.cpu.max_insts_any_thread = warmup
-    m5.simulate()
+    system.cpu.scheduleInstStop(0, warmup, "warmup done")
+    exit_event = m5.simulate()
+    if exit_event.getCause() != "warmup done":
+        print(f"Program ended during warmup: {exit_event.getCause()}")
+        raise SystemExit(1)
     m5.stats.reset()
 
 if maxinsts > 0:
     print(f"Measure: {maxinsts} insts")
-    system.cpu.max_insts_any_thread = maxinsts
+    system.cpu.scheduleInstStop(0, maxinsts, "measure done")
 else:
     print("Measure: run until program exits")
-    system.cpu.max_insts_any_thread = 0
 
 exit_event = m5.simulate()
 print(f"Exiting @ tick {m5.curTick()} because {exit_event.getCause()}")
