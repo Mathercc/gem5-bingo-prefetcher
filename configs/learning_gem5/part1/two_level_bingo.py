@@ -7,7 +7,7 @@ from m5.objects import (
     System, Root, Process, SEWorkload,
     SrcClockDomain, VoltageDomain,
     AddrRange, SystemXBar, L2XBar, MemCtrl, DDR3_1600_8x8,
-    X86TimingSimpleCPU, X86O3CPU,
+    X86TimingSimpleCPU, X86O3CPU, X86AtomicSimpleCPU,
     BingoPrefetcher, SmsPrefetcher, AMPMPrefetcher, BOPPrefetcher,
     SignaturePathPrefetcher,
 )
@@ -33,9 +33,13 @@ SimpleOpts.add_option("--argv", type=str, default="",
 
 SimpleOpts.add_option("--maxinsts", type=int, default=200000,
                       help="Measurement instructions after warmup (0 = run until program exits)")
-SimpleOpts.add_option("--cpu", choices=["timing", "o3"], default="timing")
+SimpleOpts.add_option("--cpu", choices=["timing", "o3", "atomic"], default="timing",
+                      help="atomic is only for counting instructions quickly")
 
 # Bingo knobs
+SimpleOpts.add_option("--fast-forward", type=int, default=0,
+                      help="Instructions to run on an atomic CPU (caches warm, "
+                           "no timing) before switching to --cpu")
 SimpleOpts.add_option("--warmup-insts", type=int, default=0,
                       help="Warmup instructions before stats reset")
 SimpleOpts.add_option("--bingo-region-size", type=int, default=2048)
@@ -66,10 +70,13 @@ system.clk_domain = SrcClockDomain()
 system.clk_domain.clock = "1GHz"
 system.clk_domain.voltage_domain = VoltageDomain()
 
-system.mem_mode = "timing"
+ff = args.fast_forward > 0 and args.cpu != "atomic"
+system.mem_mode = "atomic" if args.cpu == "atomic" or ff else "timing"
 system.mem_ranges = [AddrRange("512MiB")]
 
-system.cpu = X86O3CPU() if args.cpu == "o3" else X86TimingSimpleCPU()
+detailed = {"o3": X86O3CPU, "atomic": X86AtomicSimpleCPU}.get(
+    args.cpu, X86TimingSimpleCPU)
+system.cpu = X86AtomicSimpleCPU() if ff else detailed()
 
 system.cpu.icache = L1ICache(args)
 system.cpu.dcache = L1DCache(args)
@@ -80,6 +87,11 @@ system.cpu.dcache.connectCPU(system.cpu)
 system.l2bus = L2XBar()
 system.cpu.icache.connectBus(system.l2bus)
 system.cpu.dcache.connectBus(system.l2bus)
+if ff:
+    # Switching CPUs hands over every port, so the page-table walkers must be
+    # connected (SE mode never uses them).
+    system.cpu.mmu.connectWalkerPorts(
+        system.l2bus.cpu_side_ports, system.l2bus.cpu_side_ports)
 
 system.l2cache = L2Cache(args)
 if args.enable_bingo:
@@ -149,6 +161,17 @@ process.cmd = [args.binary] + bin_argv
 system.cpu.workload = process
 system.cpu.createThreads()
 
+if ff:
+    # Same setup as configs/common/Simulation.py; the switched-in CPU takes
+    # over the caches and interrupt controller of the atomic one.
+    # system is left to Parent.any: assigning it here would make the
+    # still-unparented system a child of the CPU
+    system.switch_cpu = detailed(switched_out=True, cpu_id=0)
+    system.switch_cpu.workload = system.cpu.workload
+    system.switch_cpu.clk_domain = system.cpu.clk_domain
+    system.switch_cpu.isa = system.cpu.isa
+    system.switch_cpu.createThreads()
+
 root = Root(full_system=False, system=system)
 m5.instantiate()
 
@@ -157,13 +180,24 @@ m5.instantiate()
 warmup = int(args.warmup_insts)
 maxinsts = int(args.maxinsts)
 
+cpu = system.cpu   # the CPU that is running; changes after fast-forward
 print("Beginning simulation!")
 print("Binary:", args.binary)
 print("Binary argv:", process.cmd[1:] if len(process.cmd) > 1 else [])
 
+if ff:
+    print(f"Fast-forward: {args.fast_forward} insts on the atomic CPU")
+    system.cpu.scheduleInstStop(0, args.fast_forward, "fast-forward done")
+    exit_event = m5.simulate()
+    if exit_event.getCause() != "fast-forward done":
+        print(f"Program ended during fast-forward: {exit_event.getCause()}")
+        raise SystemExit(1)
+    m5.switchCpus(system, [(system.cpu, system.switch_cpu)])
+    cpu = system.switch_cpu
+
 if warmup > 0:
     print(f"Warmup: {warmup} insts")
-    system.cpu.scheduleInstStop(0, warmup, "warmup done")
+    cpu.scheduleInstStop(0, warmup, "warmup done")
     exit_event = m5.simulate()
     if exit_event.getCause() != "warmup done":
         print(f"Program ended during warmup: {exit_event.getCause()}")
@@ -172,7 +206,7 @@ if warmup > 0:
 
 if maxinsts > 0:
     print(f"Measure: {maxinsts} insts")
-    system.cpu.scheduleInstStop(0, maxinsts, "measure done")
+    cpu.scheduleInstStop(0, maxinsts, "measure done")
 else:
     print("Measure: run until program exits")
 

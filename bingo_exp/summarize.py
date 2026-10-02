@@ -12,7 +12,7 @@ late               = extra demand MSHR hits over the baseline / baseline
 import os, re, sys
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "m5out", "bingo_exp")
-WLS = ["stream", "stride4", "chase", "spatial", "pagepat"]
+WLS = ["stream", "stride4", "chase", "spatial", "pagepat", "em3d"]
 
 
 def stats(tag, wl):
@@ -26,7 +26,8 @@ def stats(tag, wl):
             d.setdefault(m.group(1), m.group(2))  # first dump only
     g = lambda k: float(d.get(k, "nan"))
     return dict(
-        cpi=g("system.cpu.cpi"),
+        # after a fast-forward the measured CPU is switch_cpu
+        cpi=float(d.get("system.switch_cpu.cpi", d.get("system.cpu.cpi", "nan"))),
         miss=g("system.l2cache.demandMisses::total"),
         issued=g("system.l2cache.prefetcher.pfIssued"),
         useful=g("system.l2cache.prefetcher.pfUseful"),

@@ -11,7 +11,7 @@ cp -v "$HERE/src/mem/cache/prefetch/bingo.cc" "$HERE/src/mem/cache/prefetch/bing
 cp -v "$HERE/configs/learning_gem5/part1/two_level_bingo.py" \
       "$HERE/configs/learning_gem5/part1/two_level_nopf.py" \
       "$GEM5/configs/learning_gem5/part1/"
-cp -v "$HERE/memwalk2.c" "$GEM5/"
+cp -v "$HERE/memwalk2.c" "$HERE/em3d.c" "$GEM5/"
 mkdir -p "$GEM5/bingo_exp" && cp -v "$HERE"/bingo_exp/* "$GEM5/bingo_exp/" 2>/dev/null || true
 
 python3 - "$GEM5" "$HERE" <<'PY'
